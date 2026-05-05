@@ -1,0 +1,970 @@
+import numpy as np
+import random
+import pickle
+import matplotlib.pyplot as plt
+import asyncio
+import time
+import os # Import os for environment variable access
+from openai import AsyncOpenAI # Import OpenAI for local API
+from typing import Dict, Any, Tuple, List, Optional
+import math
+import json
+import logging
+import re
+
+# Set up logging for API calls and errors
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- 1. CONFIGURATION AND CONSTANTS ---
+# Negotiation Setup
+NUM_TRIALS = 200  # Reduced to 2 for faster testing with LLM calls
+MAX_ROUNDS = 5    # Max rounds per trial
+TIMESTEP_S = 0.01  # Simulation time step (tau)
+
+# LLM API Configuration (OpenAI Compatible for Local LLM)
+MODEL_ID = "otel-llm-1b-it"
+aclient = AsyncOpenAI(
+    base_url="http://localhost:1234/v1", 
+    api_key="lm-studio",
+    timeout=15.0 # Added explicit timeout to prevent hanging connections
+)
+MAX_RETRIES = 5
+
+# Network Slicing Constraints (Ground Truth)
+TOTAL_RAN_BANDWIDTH_MHZ = 60.0
+eMBB_MAX_CPU_GHZ = 20.0 # Max CPU this slice can use (fmax_i)
+URLLC_MAX_CPU_GHZ = 20.0
+# Simplification: Assume constant spectral efficiency and CPU utilization factor
+SPECTRAL_EFFICIENCY_BITS_PER_HZ = 5.0 # R/B
+CPU_UTILIZATION_FACTOR_BITS_PER_HZ_PER_GHZ = 1e9 * 0.9 # U, scaled to 0.5 bits/s per Hz per GHz
+
+# Slice SLAs
+eMBB_SLA_LATENCY_MS = 50.0  # Relaxed
+URLLC_SLA_LATENCY_MS = 10.0 # Strict
+
+# Energy Model Parameters (watts)
+P_STATIC = 5.0 # Static base power
+C_BW = 0.5     # Cost per MHz
+C_CPU = 0.001  # Cost per GHz^3 (cubic power model)
+
+# Traffic Model (Simplified time-varying traffic)
+def get_traffic_arrival_rate_bps(t: int, slice_id: str) -> float:
+    """Provides a time-varying traffic arrival rate."""
+    base_rate = 90e6 if slice_id == 'eMBB' else 40e6
+    fluctuation = (math.sin(t * 0.1) * 0.3 + 1.0) # Oscillation between 0.7 and 1.3
+    if slice_id == 'eMBB':
+        return base_rate * fluctuation
+    else: # URLLC, often more bursty/lower volume but strict
+        return base_rate * (1 + 0.5 * (t % 10 == 0)) * fluctuation # occasional bursts
+    
+# --- LLM API CALLER WITH BACKOFF ---
+
+async def call_llm_api(system_prompt: str, user_query: str, schema: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Calls the Local OpenAI-compatible API using AsyncOpenAI.
+    Uses strict prompting and regex fallback for 1B models.
+    """
+    # Extremely strict system prompt for small models
+    strict_system = (
+        "You are an automated JSON-generating API. "
+        "You do not output conversational text. You only output raw, valid JSON. "
+        "No markdown, no intro, no outro."
+    )
+    
+    # Combine the persona, context, and format rules into the user prompt
+    strict_user = (
+        f"{system_prompt}\n\n"
+        f"CONTEXT/SITUATION:\n{user_query}\n\n"
+        f"REQUIRED JSON FORMAT:\n{{\n  \"proposed_bandwidth_mhz\": <float>,\n  \"reasoning\": \"<string>\"\n}}\n\n"
+        f"Respond with JSON only, starting with {{"
+    )
+    
+    messages = [
+        {"role": "system", "content": strict_system},
+        {"role": "user", "content": strict_user}
+    ]
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = await aclient.chat.completions.create(
+                model=MODEL_ID,
+                messages=messages,
+                temperature=0.1, # Reduced temperature to force strict JSON compliance
+                max_tokens=250 # Force stop to prevent infinite background generation lag
+            )
+            
+            json_text = response.choices[0].message.content
+            parsed_json = None
+            
+            # 1. Clean markdown formatting if present
+            clean_text = json_text.strip()
+            if "```json" in clean_text:
+                clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in clean_text:
+                parts = clean_text.split("```")
+                if len(parts) >= 3:
+                    clean_text = parts[1].strip()
+
+            # 2. Try to pinpoint outer braces
+            start_idx = clean_text.find('{')
+            end_idx = clean_text.rfind('}')
+            
+            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                clean_json_str = clean_text[start_idx:end_idx+1]
+                try:
+                    parsed_json = json.loads(clean_json_str)
+                except json.JSONDecodeError:
+                    pass # Let the desperate fallback try to handle it
+
+            # 3. Desperate Fallback for 1B models that completely ignore JSON instructions
+            if parsed_json is None:
+                # Look for numbers followed by MHz, or numbers near "propose"
+                bw_match = re.search(r'(\d+\.\d+|\d+)\s*mhz', clean_text, re.IGNORECASE)
+                if not bw_match:
+                    bw_match = re.search(r'propose\s*(\d+\.\d+|\d+)', clean_text, re.IGNORECASE)
+                
+                if bw_match:
+                    parsed_json = {
+                        "proposed_bandwidth_mhz": float(bw_match.group(1)),
+                        "reasoning": clean_text.strip()
+                    }
+                    logging.info(f"Used desperate regex fallback to extract {parsed_json['proposed_bandwidth_mhz']} MHz from plain text.")
+                else:
+                    raise ValueError(f"No JSON object and no parseable bandwidth found in response: {json_text}")
+
+            # 4. Validate against Schema Required Keys
+            if parsed_json is not None:
+                # Handle 1B model quirk: hallucinating the schema wrapper {"type": "OBJECT", "properties": {...}}
+                if "properties" in parsed_json and isinstance(parsed_json["properties"], dict):
+                    parsed_json = parsed_json["properties"]
+                
+                required_keys = schema.get("required", [])
+                missing_keys = [k for k in required_keys if k not in parsed_json]
+                if missing_keys:
+                    raise ValueError(f"JSON parsed but missing required keys {missing_keys}. Parsed: {parsed_json}")
+                
+                # Handle 1B model quirk: returning units in string (e.g. "23.95 MHz" instead of 23.95)
+                if "proposed_bandwidth_mhz" in parsed_json:
+                    bw_val = str(parsed_json["proposed_bandwidth_mhz"])
+                    num_match = re.search(r"[-+]?\d*\.\d+|\d+", bw_val)
+                    if num_match:
+                        parsed_json["proposed_bandwidth_mhz"] = float(num_match.group())
+                    else:
+                        raise ValueError(f"Bandwidth does not contain a numeric value: {bw_val}")
+
+                return parsed_json
+
+        except Exception as e:
+            wait_time = 2 ** attempt + random.random()
+            logging.error(f"LLM Parsing/Validation Error: {e}. Retrying in {wait_time:.2f}s (Attempt {attempt + 1}/{MAX_RETRIES}).")
+            await asyncio.sleep(wait_time)
+
+    return None
+
+# --- 2. DIGITAL TWIN AND NETWORK SIMULATOR ---
+
+class NetworkSimulator:
+    """Manages the ground truth state of the network slices."""
+    def __init__(self, slice_id: str, max_cpu_ghz: float, sla_ms: float):
+        self.slice_id = slice_id
+        self.fmax = max_cpu_ghz
+        self.sla_ms = sla_ms
+        self.tau = TIMESTEP_S
+        self.cpu_factor = CPU_UTILIZATION_FACTOR_BITS_PER_HZ_PER_GHZ
+        
+        # Current State
+        self.cqueue_bits = 0.0 # Edge queue (compute)
+        self.rqueue_bits = 0.0 # RAN queue (radio)
+        self.t = 0
+        self.current_traffic_arrival_rate_bps = get_traffic_arrival_rate_bps(0, self.slice_id)
+
+        # Metrics for ground truth tracking
+        self.latency_ms_history = []
+        self.energy_watts_history = []
+        self.sla_violations = 0
+        
+    def _calculate_slice_capacity(self, ran_bandwidth_mhz: float) -> float:
+        """Calculates the overall bottleneck capacity for the slice (in bps)."""
+        edge_capacity_bps = self.fmax * self.cpu_factor
+        ran_capacity_bps = ran_bandwidth_mhz * 1e6 * SPECTRAL_EFFICIENCY_BITS_PER_HZ
+        return min(edge_capacity_bps, ran_capacity_bps)
+
+    def _calculate_energy_consumption(self, ran_bandwidth_mhz: float) -> float:
+        """Calculates energy consumption (simplified linear model + cubic CPU)."""
+        e_bw = ran_bandwidth_mhz * C_BW
+        e_cpu = (self.fmax / 100.0)**3 * C_CPU * 100000.0 
+        return P_STATIC + e_bw + e_cpu
+
+    def _calculate_max_possible_energy(self) -> float:
+        """
+        Calculates the maximum energy this slice would consume when sharing the
+        full system load (assuming 20MHz allocation for max consumption check).
+        Used for setting the system's BASE_ENERGY_WATTS reference.
+        """
+        ran_bandwidth_mhz = TOTAL_RAN_BANDWIDTH_MHZ / 2.0 
+        return self._calculate_energy_consumption(ran_bandwidth_mhz)
+    
+    def step(self, ran_bandwidth_mhz: float) -> Dict[str, float]:
+        """Advance the ground truth simulation by one time step."""
+        self.t += 1
+        current_traffic = get_traffic_arrival_rate_bps(self.t, self.slice_id)
+        
+        arriving_data_in_tau = self.tau * current_traffic
+        slice_capacity_bps = self._calculate_slice_capacity(ran_bandwidth_mhz)
+        
+        Q_before_tx = self.cqueue_bits + self.rqueue_bits + arriving_data_in_tau
+        
+        # --- FIXED LATENCY CALCULATION ---
+        if slice_capacity_bps > 0:
+            latency_sec = Q_before_tx / slice_capacity_bps
+        else:
+            latency_sec = 1.0 if Q_before_tx > 0 else 0.0
+            
+        latency_ms = latency_sec * 1000.0
+        
+        # Update queue state based on what could be transmitted in this timestep
+        radio_capacity_in_tau = self.tau * slice_capacity_bps
+        transmitted_data_in_tau = min(Q_before_tx, radio_capacity_in_tau)
+        Q_after_tx = max(0, Q_before_tx - transmitted_data_in_tau)
+        self.cqueue_bits = 0 
+        self.rqueue_bits = Q_after_tx 
+        
+        energy_watts = self._calculate_energy_consumption(ran_bandwidth_mhz)
+        
+        self.latency_ms_history.append(latency_ms)
+        self.energy_watts_history.append(energy_watts)
+        if latency_ms > self.sla_ms:
+            self.sla_violations += 1
+
+        return {
+            "latency_ms": latency_ms,
+            "energy_watts": energy_watts
+        }
+
+class SliceDigitalTwin(NetworkSimulator):
+    """Used by agents to predict the outcome of a proposed bandwidth allocation."""
+
+    def __init__(self, slice_id: str, max_cpu_ghz: float, sla_ms: float):
+        super().__init__(slice_id, max_cpu_ghz, sla_ms)
+        self.average_arrival_rate_bps = 0.0
+        
+    def reset_to_current_state(self, current_state: Dict[str, Any]):
+        """Resets DT state using the ground truth state."""
+        self.cqueue_bits = current_state["cqueue_bits"]
+        self.rqueue_bits = current_state["rqueue_bits"]
+        self.t = current_state["t"]
+        self.average_arrival_rate_bps = current_state["average_arrival_rate_bps"]
+        
+    def get_current_context(self) -> Dict[str, float]:
+        """Exposes key metrics for LLM reasoning."""
+        return {
+            "current_queue_bits": self.cqueue_bits + self.rqueue_bits,
+            "average_arrival_rate_mbps": self.average_arrival_rate_bps / 1e6
+        }
+        
+    def simulate_step_for_prediction(self, proposed_ran_bandwidth_mhz: float) -> Dict[str, float]:
+        """Predicts one step with the proposed bandwidth, using the steady-state M/M/1 CVaR approximation."""
+        
+        # Fine-tuning: Adjust arrival rate to account for burstiness in the DT.
+        # URLLC traffic has deterministic 50% bursts, eMBB has slow sine-wave drift.
+        # The DT must provision for these peaks, otherwise the actual queue will overflow during evaluation!
+        burst_margin = 1.5 if self.slice_id == 'URLLC' else 1.05
+        arrival_rate = self.average_arrival_rate_bps * burst_margin
+        
+        slice_capacity_bps = self._calculate_slice_capacity(proposed_ran_bandwidth_mhz)
+        
+        rho = arrival_rate / slice_capacity_bps if slice_capacity_bps > 0 else 2.0
+        
+        predicted_cvar_latency_ms = 1000.0 # Default high latency
+        if rho < 1.0:
+            packet_size_bits = 8000
+            lambda_p = arrival_rate / packet_size_bits
+            mu_p = slice_capacity_bps / packet_size_bits
+            
+            if mu_p > lambda_p:
+                mean_sojourn_sec = (1.0 / (mu_p - lambda_p))
+                
+                # --- CVaR Latency Approach ---
+                # Calculating Conditional Value at Risk for latency (Exponential Distribution tail)
+                alpha = 0.95 # 95% Confidence Level
+                var_sec = -math.log(1.0 - alpha) * mean_sojourn_sec
+                cvar_sec = var_sec + mean_sojourn_sec
+                
+                predicted_cvar_latency_ms = cvar_sec * 1000.0
+            
+        predicted_energy_watts = self._calculate_energy_consumption(proposed_ran_bandwidth_mhz)
+
+        return {
+            "predicted_cvar_latency_ms": predicted_cvar_latency_ms,
+            "predicted_energy_watts": predicted_energy_watts
+        }
+
+# --- 3. MEMORY CLASSES (Simplified to ONLY Vanilla Memory) ---
+
+class Memory:
+    """Base class (Vanilla) for storing and retrieving joint strategies."""
+    def __init__(self):
+        self.log = [] 
+
+    def update(self, state_hash: int, initial_anchor: Tuple[float, float], final_agreement: Optional[Tuple[float, float]], outcome: bool):
+        """Stores the result of a negotiation round."""
+        proposal_to_log = final_agreement if outcome and final_agreement else initial_anchor
+        self.log.append((state_hash, proposal_to_log, outcome))
+
+    def distill_strategy(self, state_hash: int, current_bw_needed: float) -> Optional[Tuple[float, float]]:
+        successful_attempts = [
+            p for h, p, success in self.log 
+            if success
+        ]
+        
+        if successful_attempts:
+            avg_p = np.mean(successful_attempts, axis=0)
+            return tuple(avg_p)
+        return None
+
+
+# --- 4. LLM-POWERED AGENT CLASS (Utility Updated) ---
+
+class NegotiationAgent:
+    """Represents a slice manager agent (eMBB or URLLC) powered by an LLM for reasoning."""
+    def __init__(self, slice_id: str, max_cpu_ghz: float, sla_ms: float):
+        self.slice_id = slice_id
+        self.sla_ms = sla_ms
+        self.max_cpu_ghz = max_cpu_ghz
+        self.dt = SliceDigitalTwin(slice_id, max_cpu_ghz, sla_ms)
+        self.opp_id = 'URLLC' if slice_id == 'eMBB' else 'eMBB'
+        
+        # Track LLM latency response times
+        self.llm_response_times = []
+        
+        # Use only Vanilla Memory
+        self.memory = Memory() 
+
+    def utility(self, latency_ms: float, energy_watts: float) -> float:
+        """Calculates utility: maximizing SLA fulfillment and minimizing energy, 
+        with a secondary focus on energy when latency is well-secured."""
+        # Cost 1: Latency metric
+        latency_cost = 0.0
+        
+        SLA_VIOLATION_PENALTY = 500.0 
+        
+        if latency_ms > self.sla_ms:
+            latency_cost = SLA_VIOLATION_PENALTY * (latency_ms - self.sla_ms) / self.sla_ms
+        else:
+            if latency_ms < self.sla_ms * 0.5:
+                latency_cost = -1.0 * (self.sla_ms - latency_ms) / self.sla_ms
+            else:
+                latency_cost = -1.0 * (self.sla_ms - latency_ms) / self.sla_ms
+            
+        # Cost 2: Energy cost (normalized)
+        base_energy_ref = P_STATIC + TOTAL_RAN_BANDWIDTH_MHZ * C_BW + URLLC_MAX_CPU_GHZ * C_CPU
+        energy_cost = energy_watts / base_energy_ref * 10.0 
+        
+        return -(latency_cost + energy_cost)
+
+    def reason_and_evaluate(self, bw_proposal: float) -> Tuple[float, float, float]:
+        """Uses DT to predict outcome and calculate utility for a given BW allocation."""
+        dt_metrics = self.dt.simulate_step_for_prediction(bw_proposal)
+        utility = self.utility(dt_metrics["predicted_cvar_latency_ms"], dt_metrics["predicted_energy_watts"])
+        
+        return dt_metrics["predicted_cvar_latency_ms"], dt_metrics["predicted_energy_watts"], utility
+    
+    async def _call_llm_for_proposal(self, context: str) -> Optional[float]:
+        """Helper to call local OpenAI API for structured proposal generation."""
+        schema = {
+            "type": "OBJECT",
+            "properties": {
+                "proposed_bandwidth_mhz": {"type": "NUMBER", "description": "The bandwidth (in MHz) requested by this slice (A1 or A2). Must be between 1.0 and 40.0."},
+                "reasoning": {"type": "STRING", "description": "The reasoning for the proposed bandwidth based on the DT prediction and utility function."}
+            },
+            "required": ["proposed_bandwidth_mhz"]
+        }
+        
+        system_prompt = (
+            f"You are the autonomous resource negotiation agent for the {self.slice_id} network slice. "
+            f"Your primary goal is to **maximize your utility** by **meeting your SLA of {self.sla_ms}ms** "
+            f"(Evaluated using Conditional Value at Risk - CVaR tail latency) "
+            f"and minimizing energy consumption. You must reason using the provided Digital Twin (DT) prediction and your utility function. "
+            f"The total available RAN bandwidth is {TOTAL_RAN_BANDWIDTH_MHZ} MHz. "
+            f"Your utility function prioritizes avoiding SLA violations (high penalty) over minimizing energy. "
+            f"Negotiate iteratively with your peer agent. Reason and propose or counter-propose. Do NOT ACCEPT immediately."
+        )
+
+        start_time = time.time()
+        llm_output = await call_llm_api(system_prompt, context, schema)
+        elapsed_time = time.time() - start_time
+        
+        # Log the response time
+        self.llm_response_times.append(elapsed_time)
+
+        if llm_output and 'proposed_bandwidth_mhz' in llm_output:
+            bw = llm_output['proposed_bandwidth_mhz']
+            return max(1.0, min(bw, TOTAL_RAN_BANDWIDTH_MHZ - 1.0))
+        
+        logging.warning(f"[{self.slice_id} LLM Proposal Failed] Using heuristic fallback.")
+        min_bw = 15.0 
+        search_target = 0.5 if self.slice_id == 'URLLC' else 0.9
+        for bw in np.arange(1.0, TOTAL_RAN_BANDWIDTH_MHZ, 1.0):
+            cvar_latency, _, _ = self.reason_and_evaluate(bw) 
+            if cvar_latency <= self.sla_ms * search_target: 
+                min_bw = bw
+                break
+        return min_bw * 1.05 
+        
+    
+    def _calculate_min_bw_needed(self):
+        """Calculates the minimum BW needed to meet SLA at CVaR (with a buffer)."""
+        min_bw_needed = 15.0 # Initial guess
+        search_target = 0.3 if self.slice_id == 'URLLC' else 0.9
+        for bw in np.arange(1.0, TOTAL_RAN_BANDWIDTH_MHZ, 1.0):
+            cvar_latency, _, _ = self.reason_and_evaluate(bw)
+            if cvar_latency <= self.sla_ms * search_target: 
+                min_bw_needed = bw
+                break
+        return min_bw_needed * 1.05 
+    
+    async def _propose_initial_with_anchor_strategy(self, anchor_strategy: str) -> float:
+        """
+        Generates the initial bandwidth proposal (anchor) using LLM reasoning,
+        applying either a Fixed (DT-based) or Randomized strategy.
+        """
+        min_bw_needed = self._calculate_min_bw_needed()
+        
+        if anchor_strategy == 'randomized':
+            # STRATEGIC INSPIRATION: We return to a highly precise 'low-ball' strategy.
+            # By anchoring slightly below the true optimum, the agent forces the opponent to concede first,
+            # and triggers the "Proportional Climb" counter-proposal logic, which gracefully lands
+            # precisely on the 0.0 utility degradation mark without overshooting.
+            true_optimum = min_bw_needed / 1.05
+            
+            # Fine-tuning: Give URLLC a slightly safer floor due to strict CVaR sensitivity
+            if self.slice_id == 'URLLC':
+                min_limit = max(1.0, true_optimum * 0.85) # Increased from 0.75
+                mode_limit = true_optimum * 0.98 # Increased from 0.95
+                shape_k = 5.0 # Tightly peaked (low variance) around safe mode
+            else:
+                min_limit = max(1.0, true_optimum * 0.6)
+                mode_limit = true_optimum * 0.90 # Mode is 10% below optimum to guarantee a slight upward climb
+                shape_k = 2.0 # Wider exploration and more aggressive low-balling
+                
+            max_limit = min(TOTAL_RAN_BANDWIDTH_MHZ * 0.9, true_optimum * 1.1)
+
+            scale_lambda = (mode_limit - min_limit) / math.pow((shape_k - 1) / shape_k, 1.0 / shape_k)
+
+            f_beta = 1.0 - math.exp(-math.pow((max_limit - min_limit) / scale_lambda, shape_k))
+            u = random.uniform(0.0, f_beta)
+            safe_u = min(u, 0.999999) 
+            initial_bw = min_limit + scale_lambda * math.pow(-math.log(1.0 - safe_u), 1.0 / shape_k)
+            
+            context_data = {
+                "negotiation_stage": "Initial Proposal (Weibull Randomized Anchor)",
+                "slice_id": self.slice_id,
+                "calculated_min_bw_mhz": f"{min_bw_needed:.2f}",
+                "distribution": f"Truncated Weibull (alpha={min_limit:.2f}, beta={max_limit:.2f}, mode={mode_limit:.2f})",
+                "dt_context": self.dt.get_current_context(),
+                "initial_proposal_mhz": f"{initial_bw:.2f}",
+            }
+            context = (
+                f"This is the initial proposal. The anchor value was generated using a Truncated Weibull "
+                f"probability distribution. This creates a strategic 'low-ball' anchor designed to "
+                f"save energy by exponentially penalizing greedy demands, but placed carefully so you can still negotiate successfully within {MAX_ROUNDS} rounds. "
+                f"For this specific initial round, you **must propose exactly the given initial_proposal_mhz**. "
+                f"In subsequent counter-proposal rounds, you have the flexibility to negotiate and adjust "
+                f"your request upwards based on your utility and latency requirements. "
+                f"Current state and context:\n***{json.dumps(context_data, indent=2)}***\n"
+            )
+            _ = await self._call_llm_for_proposal(context) 
+            return initial_bw
+            
+        else: # Fixed Anchor Strategy
+            initial_bw = min_bw_needed
+            context_data = {
+                "negotiation_stage": "Initial Proposal (Fixed Anchor)",
+                "slice_id": self.slice_id,
+                "min_bw_for_sla_mhz": f"{min_bw_needed:.2f}",
+                "dt_context": self.dt.get_current_context(),
+                "current_memory_suggestion_mhz": self.memory.distill_strategy(0, 0)
+            }
+            
+            context = (
+                f"This is the initial proposal (Anchor). Current state and context:\n"
+                f"***{json.dumps(context_data, indent=2)}***\n"
+                f"Propose a bandwidth (in MHz) that ensures high utility, considering past successes (memory) and your minimum requirement. "
+                f"Propose slightly higher than the minimum requirement to create a negotiation margin."
+            )
+            return await self._call_llm_for_proposal(context)
+
+    async def counter_propose(self, opp_proposal: float, round_num: int, current_bw_i: float, context: Optional[str] = None) -> float:
+        """Generates a counter-proposal based on opponent's move and utility using LLM reasoning."""
+        
+        # Predict utility if the current *implied* split were accepted
+        lat_check, energy_check, util_check = self.reason_and_evaluate(current_bw_i)
+
+        # --- ADVANCED CONCEPT: Simulated Annealing for Concession Strategy ---
+        concession_pressure = (round_num - 1) / max(1, (MAX_ROUNDS - 1))
+
+        context_data = {
+            "negotiation_stage": f"Counter Proposal (Round {round_num}/{MAX_ROUNDS})",
+            "concession_pressure": f"{concession_pressure:.2f} (0.0 = Firm, 1.0 = Highly Flexible)",
+            "slice_id": self.slice_id,
+            "my_current_proposal_mhz": f"{current_bw_i:.2f}",
+            "opp_proposal_mhz": f"{opp_proposal:.2f}",
+            "predicted_outcome_of_my_proposal": {
+                "cvar_latency_ms": f"{lat_check:.2f}",
+                "utility": f"{util_check:.2f}",
+                "status": "Acceptable" if util_check > -5.0 else "Unacceptable"
+            },
+            "acceptance_threshold_utility": -5.0,
+        }
+        
+        if context:
+            context_data["specific_instruction"] = context
+        
+        final_context = (
+            f"This is a counter-proposal. Analyze the situation and submit a new bandwidth request:\n"
+            f"***{json.dumps(context_data, indent=2)}***\n"
+            f"Remember, your primary goal is to maintain utility > -5.0, and your secondary goal is to minimize your request to save overall energy. "
+            f"Pay close attention to 'concession_pressure'. At pressure near 1.0, you MUST make larger concessions toward the opponent's proposal to avoid a failed negotiation. "
+            f"If your current utility is high but your latency is much better than the SLA, you should prioritize reducing your request. "
+            f"If you need more bandwidth for utility, **increase** your request. If you can concede to close the deal or reduce total load, **decrease** your request."
+        )
+        
+        return await self._call_llm_for_proposal(final_context)
+
+
+# --- 5. NEGOTIATOR AND MAIN ASYNCHRONOUS LOOP ---
+
+class AgenticNegotiator:
+    """Manages the negotiation process and collects metrics."""
+    def __init__(self, anchor_strategy: str):
+        # Initialize two slices and their ground-truth simulators
+        self.sim_embb = NetworkSimulator('eMBB', eMBB_MAX_CPU_GHZ, eMBB_SLA_LATENCY_MS)
+        self.sim_urllc = NetworkSimulator('URLLC', URLLC_MAX_CPU_GHZ, URLLC_SLA_LATENCY_MS)
+        
+        # Initialize two agents, both using Vanilla Memory
+        self.agent_embb = NegotiationAgent('eMBB', eMBB_MAX_CPU_GHZ, eMBB_SLA_LATENCY_MS)
+        self.agent_urllc = NegotiationAgent('URLLC', URLLC_MAX_CPU_GHZ, URLLC_SLA_LATENCY_MS)
+        
+        self.agents = {'eMBB': self.agent_embb, 'URLLC': self.agent_urllc}
+        self.simulators = {'eMBB': self.sim_embb, 'URLLC': self.sim_urllc}
+        self.anchor_strategy = anchor_strategy.capitalize()
+
+        # Metric Collection Updated for plotting needs
+        self.metrics = {
+            'eMBB': {
+                'latency_ms': [], 'energy_save_perc': [], 'unsolved_agreements': 0, 
+                'sla_violations': 0, 'anchor_distance': [], 'anchor_distance_sq': [], 'utility_degradation': []
+            },
+            'URLLC': {
+                'latency_ms': [], 'energy_save_perc': [], 'unsolved_agreements': 0, 
+                'sla_violations': 0, 'anchor_distance': [], 'anchor_distance_sq': [], 'utility_degradation': []
+            },
+            'total_agreements_solved': 0,
+            'total_trials': 0,
+            'llm_response_times': [] # Added root-level key for LLM response times
+        }
+        
+        # Base energy for energy saving calculation
+        self.BASE_ENERGY_WATTS = self.sim_embb._calculate_max_possible_energy() + \
+                                 self.sim_urllc._calculate_max_possible_energy()
+        
+        print(f"Energy Ref (Max Consumption @ 20MHz each): {self.BASE_ENERGY_WATTS:.2f} W")
+
+
+    def _get_current_state(self, slice_id: str) -> Dict[str, Any]:
+        """Collects the ground-truth state for the DT reset."""
+        sim = self.simulators[slice_id]
+        
+        current_traffic = get_traffic_arrival_rate_bps(sim.t, slice_id)
+        if sim.t == 0:
+            avg_traffic = current_traffic
+        else:
+            avg_traffic = (sim.t * sim.current_traffic_arrival_rate_bps + current_traffic) / (sim.t + 1)
+        sim.current_traffic_arrival_rate_bps = avg_traffic
+        
+        return {
+            "cqueue_bits": sim.cqueue_bits,
+            "rqueue_bits": sim.rqueue_bits,
+            "t": sim.t,
+            "average_arrival_rate_bps": avg_traffic
+        }
+    
+    async def _run_negotiation(self) -> Optional[Tuple[float, float]]:
+        """
+        Executes the asynchronous negotiation protocol between the two agents.
+        """
+        # 1. Reset DTs to current ground-truth state
+        self.agent_embb.dt.reset_to_current_state(self._get_current_state('eMBB'))
+        self.agent_urllc.dt.reset_to_current_state(self._get_current_state('URLLC'))
+        
+        # Extract theoretical optimal baseline (a^\dagger) before negotiation starts
+        optimal_eMBB = self.agent_embb._calculate_min_bw_needed()
+        optimal_URLLC = self.agent_urllc._calculate_min_bw_needed()
+        
+        # 2. Initial Proposal (Anchor) - ASYNCHRONOUS CALLS
+        # Parallelize the initial independent anchor requests to save time
+        anchor_eMBB, anchor_URLLC = await asyncio.gather(
+            self.agent_embb._propose_initial_with_anchor_strategy(self.anchor_strategy.lower()),
+            self.agent_urllc._propose_initial_with_anchor_strategy(self.anchor_strategy.lower())
+        )
+        
+        print(f"\n[NEGOTIATION START: {self.anchor_strategy} Anchor]")
+        print(f"  [ANCHOR] eMBB Proposal: {anchor_eMBB:.2f}MHz (Goal={eMBB_SLA_LATENCY_MS}ms) | URLLC Proposal: {anchor_URLLC:.2f}MHz (Goal={URLLC_SLA_LATENCY_MS}ms)")
+
+        current_req_embb = anchor_eMBB
+        current_req_urllc = anchor_URLLC
+        
+        current_req_embb = max(1.0, min(current_req_embb, TOTAL_RAN_BANDWIDTH_MHZ - 1.0))
+        current_req_urllc = max(1.0, min(current_req_urllc, TOTAL_RAN_BANDWIDTH_MHZ - 1.0))
+
+        initial_anchor_joint = (anchor_eMBB, anchor_URLLC)
+        final_agreement = None
+        
+        ACCEPTANCE_THRESHOLD = -5.0
+        
+        for r in range(1, MAX_ROUNDS + 1):
+            total_req = current_req_embb + current_req_urllc
+            
+            # --- EVALUATION ---
+            lat_e, _, util_e = self.agent_embb.reason_and_evaluate(current_req_embb)
+            lat_u, _, util_u = self.agent_urllc.reason_and_evaluate(current_req_urllc)
+            
+            is_feasible = total_req <= TOTAL_RAN_BANDWIDTH_MHZ
+            is_sla_violated_e = lat_e > self.agent_embb.sla_ms
+            is_sla_violated_u = lat_u > self.agent_urllc.sla_ms
+            is_satisfied_e = util_e > ACCEPTANCE_THRESHOLD
+            is_satisfied_u = util_u > ACCEPTANCE_THRESHOLD
+            
+            print(f"\n--- Round {r}/{MAX_ROUNDS} ---")
+            print(f"  Current Joint Request: (eMBB: {current_req_embb:.2f}, URLLC: {current_req_urllc:.2f}) MHz | Total: {total_req:.2f} MHz (Limit: {TOTAL_RAN_BANDWIDTH_MHZ} MHz)")
+            print(f"  [eMBB Eval] CVaR Latency={lat_e:.2f}ms, Utility={util_e:.2f}. Satisfied: {is_satisfied_e} (SLA OK: {not is_sla_violated_e})")
+            print(f"  [URLLC Eval] CVaR Latency={lat_u:.2f}ms, Utility={util_u:.2f}. Satisfied: {is_satisfied_u} (SLA OK: {not is_sla_violated_u})")
+
+            # --- CRITICAL ACCEPTANCE CHECK ---
+            if is_feasible and is_satisfied_e and is_satisfied_u:
+                final_agreement = (current_req_embb, current_req_urllc)
+                print(f"  [COMMIT] Feasible and both satisfied. Final agreement reached.")
+                break
+                
+            # --- COUNTER-PROPOSAL LOGIC (PID-Like Proportional Step) ---
+            # To fix the massive overshoot issues caused by CVaR's large baseline bandwidth requirements,
+            # we scale the step sizes proportionally based on how severely the SLA is violated (or how safe it is).
+            MAX_STEP_E = 10.0
+            MAX_STEP_U = 10.0
+
+            base_step_e = MAX_STEP_E * (MAX_ROUNDS - r + 1) / MAX_ROUNDS
+            base_step_u = MAX_STEP_U * (MAX_ROUNDS - r + 1) / MAX_ROUNDS
+            
+            # **1. eMBB Counter-Proposes**
+            new_req_embb = current_req_embb
+            context_e = None
+            target_req_e = current_req_embb
+
+            if is_sla_violated_e:
+                # Proportional Climb: Calculate severity. Huge violation = huge jump. Tiny violation = tiny jump.
+                severity = lat_e / self.agent_embb.sla_ms
+                scaling = min(1.0, max(0.25, severity - 1.0)) # Increased min scaling from 0.1 to 0.25 for faster recovery
+                actual_step = base_step_e * scaling
+                target_req_e = current_req_embb + actual_step
+                context_e = (f"MANDATORY INCREASE (SLA VIOLATION): Your **primary goal (SLA)** is violated. "
+                             f"You must propose a **higher bandwidth**. Propose exactly **{target_req_e:.2f}MHz**.")
+            elif total_req > TOTAL_RAN_BANDWIDTH_MHZ or is_sla_violated_u:
+                # Hard concession if system is physically infeasible
+                target_req_e = max(1.0, current_req_embb - base_step_e) 
+                context_e = (f"MANDATORY CONCESSION: The joint request is **infeasible** or the critical URLLC slice is failing SLA. "
+                             f"You must **concede** by proposing a **lower bandwidth**. Propose exactly **{target_req_e:.2f}MHz**.")
+            elif not is_satisfied_e and not is_sla_violated_e: 
+                # Proportional Descent: Drop safely depending on how huge the safety margin is.
+                safety = self.agent_embb.sla_ms / max(1.0, lat_e)
+                scaling = min(1.0, max(0.1, safety - 1.0))
+                actual_step = (base_step_e * 0.5) * scaling
+                target_req_e = max(1.0, current_req_embb - actual_step) 
+                context_e = (f"IMPROVE EFFICIENCY: Your SLA is met, but your **Utility is too low** (Energy cost is too high). "
+                             f"You should slightly **reduce your bandwidth** to save energy. Propose exactly **{target_req_e:.2f}MHz**.")
+            elif is_feasible and is_satisfied_e and not is_sla_violated_e:
+                # Fine-tuning descent
+                safety = self.agent_embb.sla_ms / max(1.0, lat_e)
+                scaling = min(1.0, max(0.1, safety - 1.0))
+                actual_step = (base_step_e * 0.2) * scaling
+                target_req_e = max(1.0, current_req_embb - actual_step) 
+                context_e = (f"SECONDARY OBJECTIVE: The request is feasible and satisfactory. "
+                             f"To maximize energy savings, propose a **slightly lower bandwidth**. Propose exactly **{target_req_e:.2f}MHz**.")
+
+            if context_e:
+                context_e += f" (Current Request: {current_req_embb:.2f}MHz. Recommended Target: {target_req_e:.2f}MHz)"
+                new_req_embb = await self.agent_embb.counter_propose(current_req_urllc, r, current_req_embb, context=context_e)
+                print(f"  [eMBB Counter] New request: {new_req_embb:.2f} MHz.")
+
+            current_req_embb = new_req_embb
+            current_req_embb = min(current_req_embb, TOTAL_RAN_BANDWIDTH_MHZ - current_req_urllc)
+            current_req_embb = max(1.0, current_req_embb)
+            
+            # **2. URLLC Counter-Proposes**
+            new_req_urllc = current_req_urllc
+            context_u = None
+            target_req_u = current_req_urllc
+            
+            total_req = current_req_embb + current_req_urllc
+            is_feasible = total_req <= TOTAL_RAN_BANDWIDTH_MHZ
+            lat_u, _, util_u = self.agent_urllc.reason_and_evaluate(current_req_urllc)
+            is_sla_violated_u = lat_u > self.agent_urllc.sla_ms
+            is_satisfied_u = util_u > ACCEPTANCE_THRESHOLD
+
+            if is_sla_violated_u:
+                # Proportional Climb
+                severity = lat_u / self.agent_urllc.sla_ms
+                scaling = min(1.0, max(0.4, severity - 1.0)) # Increased min scaling from 0.25 to 0.4 for faster recovery
+                actual_step = base_step_u * scaling
+                target_req_u = current_req_urllc + actual_step
+                context_u = (f"MANDATORY INCREASE (SLA VIOLATION): Your **primary goal (SLA)** is violated. "
+                             f"You MUST propose a **higher bandwidth**. Propose exactly **{target_req_u:.2f}MHz**.")
+            elif total_req > TOTAL_RAN_BANDWIDTH_MHZ:
+                # Hard concession
+                target_req_u = max(1.0, current_req_urllc - (base_step_u * 0.5)) 
+                context_u = (f"MANDATORY CONCESSION: The joint request is **infeasible**, but your slice is meeting SLA. "
+                             f"You must make a minimal **concession** for feasibility. Propose exactly **{target_req_u:.2f}MHz**.")
+            elif not is_satisfied_u and not is_sla_violated_u: 
+                # Proportional Descent
+                safety = self.agent_urllc.sla_ms / max(1.0, lat_u)
+                scaling = min(1.0, max(0.1, safety - 1.0))
+                actual_step = (base_step_u * 0.2) * scaling
+                target_req_u = max(1.0, current_req_urllc - actual_step) 
+                context_u = (f"IMPROVE EFFICIENCY: Your SLA is met, but your **Utility is too low** (Energy cost is too high). "
+                             f"You should slightly **reduce your bandwidth** to save energy. Propose exactly **{target_req_u:.2f}MHz**.")
+            elif is_feasible and is_satisfied_u and not is_sla_violated_u:
+                # Fine-tuning descent
+                safety = self.agent_urllc.sla_ms / max(1.0, lat_u)
+                scaling = min(1.0, max(0.1, safety - 1.0))
+                actual_step = (base_step_u * 0.05) * scaling # Reduced from 0.1 to 0.05 to prevent over-conceding
+                target_req_u = max(1.0, current_req_urllc - actual_step) 
+                context_u = (f"SECONDARY OBJECTIVE: The current request is feasible and satisfactory. "
+                             f"Propose a **slightly lower bandwidth** to maximize energy saving. Propose exactly **{target_req_u:.2f}MHz**.")
+
+            if context_u:
+                context_u += f" (Current Request: {current_req_urllc:.2f}MHz. Recommended Target: {target_req_u:.2f}MHz)"
+                new_req_urllc = await self.agent_urllc.counter_propose(current_req_embb, r, current_req_urllc, context=context_u)
+                print(f"  [URLLC Counter] New request: {new_req_urllc:.2f} MHz.")
+
+            current_req_urllc = new_req_urllc
+            current_req_urllc = min(current_req_urllc, TOTAL_RAN_BANDWIDTH_MHZ - current_req_embb)
+            current_req_urllc = max(1.0, current_req_urllc)
+            
+            if r == MAX_ROUNDS and final_agreement is None:
+                if current_req_embb + current_req_urllc <= TOTAL_RAN_BANDWIDTH_MHZ:
+                    final_agreement = (current_req_embb, current_req_urllc)
+                    print(f"  [FORCED AGREEMENT] Negotiation ended without formal commit. Using last feasible request.")
+                else:
+                    final_agreement = None
+                    
+        # 3. Final outcome & Analytical Metrics Computation
+        if final_agreement is None:
+            print(f"\n[OUTCOME] Negotiation FAILED after {MAX_ROUNDS} rounds. Using default split (20/20).")
+        else:
+            print(f"[OUTCOME] Negotiation SUCCEEDED with split (eMBB: {final_agreement[0]:.2f}, URLLC: {final_agreement[1]:.2f}) MHz.")
+            
+            # --- METRIC GATHERING: Utility Degradation & Squared Anchor Distance ---
+            # Compute U(a^\dagger) -- utility using purely optimal bandwidth
+            _, _, u_opt_e = self.agent_embb.reason_and_evaluate(optimal_eMBB)
+            _, _, u_opt_u = self.agent_urllc.reason_and_evaluate(optimal_URLLC)
+            
+            # Compute U(a^\star) -- utility using finalized negotiated bandwidth
+            _, _, u_fin_e = self.agent_embb.reason_and_evaluate(final_agreement[0])
+            _, _, u_fin_u = self.agent_urllc.reason_and_evaluate(final_agreement[1])
+            
+            # Li,anchor = U(a^\dagger) - U(a^\star)
+            # Since utility values are typically negative, optimal is closer to 0. 
+            self.metrics['eMBB']['utility_degradation'].append(max(0, u_opt_e - u_fin_e))
+            self.metrics['URLLC']['utility_degradation'].append(max(0, u_opt_u - u_fin_u))
+            
+            # d_i = || a^\dagger - a^{(0)} ||^2 (Optimal vs Initial Anchor distance squared)
+            self.metrics['eMBB']['anchor_distance_sq'].append((optimal_eMBB - anchor_eMBB)**2)
+            self.metrics['URLLC']['anchor_distance_sq'].append((optimal_URLLC - anchor_URLLC)**2)
+            
+            # Retain standard distance for CDF plots (Final Agreement - Initial Anchor)
+            self.metrics['eMBB']['anchor_distance'].append(abs(final_agreement[0] - anchor_eMBB))
+            self.metrics['URLLC']['anchor_distance'].append(abs(final_agreement[1] - anchor_URLLC))
+            
+        # 4. Update memory and return
+        outcome = final_agreement is not None
+        self.agent_embb.memory.update(self.sim_embb.t, initial_anchor_joint, final_agreement, outcome)
+        self.agent_urllc.memory.update(self.sim_urllc.t, initial_anchor_joint, final_agreement, outcome)
+
+        return final_agreement
+
+    async def run_simulation(self):
+        """Runs the main loop for N trials asynchronously."""
+        print(f"--- Starting Agentic Negotiation Simulation ({self.anchor_strategy} Anchor Strategy, Vanilla Memory) ---")
+        
+        NUM_STEPS_PER_TRIAL = 10
+        
+        for trial in range(NUM_TRIALS):
+            self.metrics['total_trials'] += 1
+            logging.info(f"--- Running Trial {trial + 1}/{NUM_TRIALS} ---")
+            
+            for _ in range(NUM_STEPS_PER_TRIAL):
+                default_bw_embb = 25.0
+                default_bw_urllc = 15.0
+                self.sim_embb.step(default_bw_embb)
+                self.sim_urllc.step(default_bw_urllc)
+                
+            self.sim_embb.latency_ms_history.clear()
+            self.sim_urllc.latency_ms_history.clear()
+            self.sim_embb.energy_watts_history.clear()
+            self.sim_urllc.energy_watts_history.clear()
+            
+            agreed_bw_tuple = await self._run_negotiation()
+            
+            # --- CLEAR STATE FOR CLEAN EVALUATION ---
+            # Prevent pre-negotiation queue buildup from causing unfair SLA violations
+            self.sim_embb.cqueue_bits = 0.0
+            self.sim_embb.rqueue_bits = 0.0
+            self.sim_urllc.cqueue_bits = 0.0
+            self.sim_urllc.rqueue_bits = 0.0
+
+            # Start counting violations strictly from the post-agreement phase
+            current_violations_e = self.sim_embb.sla_violations
+            current_violations_u = self.sim_urllc.sla_violations
+            
+            if agreed_bw_tuple:
+                bw_e, bw_u = agreed_bw_tuple
+                self.metrics['total_agreements_solved'] += 1
+            else:
+                bw_e = TOTAL_RAN_BANDWIDTH_MHZ / 2.0
+                bw_u = TOTAL_RAN_BANDWIDTH_MHZ / 2.0
+                self.metrics['eMBB']['unsolved_agreements'] += 1
+                self.metrics['URLLC']['unsolved_agreements'] += 1
+
+            temp_latency_e, temp_latency_u = [], []
+            temp_energy_e, temp_energy_u = [], []
+            
+            for _ in range(NUM_STEPS_PER_TRIAL):
+                results_e = self.sim_embb.step(bw_e)
+                results_u = self.sim_urllc.step(bw_u)
+
+                temp_latency_e.append(results_e['latency_ms'])
+                temp_latency_u.append(results_u['latency_ms'])
+                temp_energy_e.append(results_e['energy_watts'])
+                temp_energy_u.append(results_u['energy_watts'])
+                
+            self.metrics['eMBB']['latency_ms'].extend(temp_latency_e)
+            self.metrics['URLLC']['latency_ms'].extend(temp_latency_u)
+
+            avg_total_energy = np.mean(temp_energy_e) + np.mean(temp_energy_u)
+            energy_saving_perc = (self.BASE_ENERGY_WATTS - avg_total_energy) / self.BASE_ENERGY_WATTS * 100
+            
+            self.metrics['eMBB']['energy_save_perc'].append(energy_saving_perc)
+            self.metrics['URLLC']['energy_save_perc'].append(energy_saving_perc)
+            
+            self.metrics['eMBB']['sla_violations'] += (self.sim_embb.sla_violations - current_violations_e)
+            self.metrics['URLLC']['sla_violations'] += (self.sim_urllc.sla_violations - current_violations_u)
+
+            # Aggregate and clear response times for this trial
+            self.metrics['llm_response_times'].extend(self.agent_embb.llm_response_times)
+            self.metrics['llm_response_times'].extend(self.agent_urllc.llm_response_times)
+            self.agent_embb.llm_response_times.clear()
+            self.agent_urllc.llm_response_times.clear()
+        
+        self._print_results()
+        self._plot_results()
+        self._save_results()
+
+    def _print_results(self):
+        """Prints the final summary to the terminal."""
+        print("\n--- Simulation Results Summary ---")
+        print(f"Anchor Strategy: {self.anchor_strategy} | Memory Type: Vanilla")
+        print(f"Total Trials: {self.metrics['total_trials']}")
+        print(f"Solved Agreements: {self.metrics['total_agreements_solved']} / {self.metrics['total_trials']} ({self.metrics['total_agreements_solved']/self.metrics['total_trials']:.2f})")
+        
+        if self.metrics['llm_response_times']:
+            avg_time = np.mean(self.metrics['llm_response_times'])
+            print(f"Average LLM API Response Time: {avg_time:.2f} s")
+
+        for slice_id in ['eMBB', 'URLLC']:
+            m = self.metrics[slice_id]
+            lat_mean = np.mean(m['latency_ms']) if m['latency_ms'] else 0
+            lat_p95 = np.percentile(m['latency_ms'], 95) if m['latency_ms'] else 0
+            
+            print(f"\n[{slice_id} Slice (SLA: {self.simulators[slice_id].sla_ms}ms)]")
+            print(f"  Unsolved Agreements: {m['unsolved_agreements']}")
+            print(f"  SLA Violations (Post-Agreement Evaluation): {m['sla_violations']}") 
+            print(f"  Mean Latency: {lat_mean:.2f} ms | 95th Percentile Latency: {lat_p95:.2f} ms")
+            print(f"  Mean Energy Saving: {np.mean(m['energy_save_perc']):.2f} %" if m['energy_save_perc'] else "N/A")
+            if m['anchor_distance']:
+                print(f"  Mean Anchor Distance: {np.mean(m['anchor_distance']):.2f} MHz")
+
+    def _plot_results(self):
+        """Generates plots for the required CDFs."""
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(f"Agentic Negotiation A2A Metrics ({self.anchor_strategy} Anchor Strategy)", fontsize=16)
+
+        data_e = self.metrics['eMBB']
+        data_u = self.metrics['URLLC']
+        
+        # --- Latency CDF ---
+        axes[0].set_title('Latency CDF per Slice')
+        for i, (data, label) in enumerate([(data_e['latency_ms'], 'eMBB (SLA=50ms)'), 
+                                           (data_u['latency_ms'], 'URLLC (SLA=10ms)')]):
+            if not data: continue
+            sorted_data = np.sort(data)
+            p = 1. * np.arange(len(data)) / (len(data) - 1)
+            axes[0].plot(sorted_data, p, label=label, marker='.', markevery=10, linestyle='--')
+        axes[0].axvline(x=eMBB_SLA_LATENCY_MS, color='blue', linestyle=':', label='eMBB SLA')
+        axes[0].axvline(x=URLLC_SLA_LATENCY_MS, color='red', linestyle=':', label='URLLC SLA')
+        axes[0].set_xlabel('Latency (ms)')
+        axes[0].set_ylabel('CDF')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+        
+        # --- Energy Saving CDF ---
+        axes[1].set_title('Energy Saving CDF')
+        if data_e['energy_save_perc']:
+            sorted_data = np.sort(self.metrics['eMBB']['energy_save_perc']) 
+            p = 1. * np.arange(len(sorted_data)) / (len(sorted_data) - 1)
+            axes[1].plot(sorted_data, p, label='Energy Saving', color='green', marker='.', markevery=1)
+            axes[1].set_xlabel('Energy Saving (%)')
+        else:
+            axes[1].text(0.5, 0.5, 'No data for Energy Saving.', horizontalalignment='center', transform=axes[1].transAxes)
+        axes[1].set_ylabel('CDF')
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        # --- Distance from Anchor CDF ---
+        axes[2].set_title('Distance from Anchor CDF (Agreement - Anchor)')
+        if data_e['anchor_distance'] or data_u['anchor_distance']:
+            for i, (data, label) in enumerate([(data_e['anchor_distance'], 'eMBB'), 
+                                               (data_u['anchor_distance'], 'URLLC')]):
+                if not data: continue
+                sorted_data = np.sort(data)
+                p = 1. * np.arange(len(data)) / (len(data) - 1)
+                axes[2].plot(sorted_data, p, label=label, marker='.', markevery=10, linestyle='--')
+            axes[2].set_xlabel('Distance from Anchor (Agreement BW - Anchor BW) [MHz]')
+        else:
+            axes[2].text(0.5, 0.5, 'No agreements to track anchor distance.', 
+                         horizontalalignment='center', transform=axes[2].transAxes)
+        
+        axes[2].set_ylabel('CDF')
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
+
+    def _save_results(self):
+        """Saves the results dictionary to a pickle file."""
+        filename = f"negotiation_results_{self.anchor_strategy.lower()}_anchor_{NUM_TRIALS}_trials.pkl"
+        with open(filename, 'wb') as f:
+            pickle.dump(self.metrics, f)
+        print(f"\nResults saved to {filename}")
+
+if __name__ == '__main__':
+    
+    # 1. Run simulation with Fixed Anchor (Vanilla Memory)
+    negotiator_fixed = AgenticNegotiator(anchor_strategy='fixed')
+    asyncio.run(negotiator_fixed.run_simulation())
+    
+    # ---
+    
+    # 2. Run simulation with Randomized Anchor (Vanilla Memory)
+    negotiator_random = AgenticNegotiator(anchor_strategy='randomized')
+    asyncio.run(negotiator_random.run_simulation())
